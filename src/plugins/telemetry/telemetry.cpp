@@ -38,11 +38,12 @@ using MagneticFieldFrd = Telemetry::MagneticFieldFrd;
 using Imu = Telemetry::Imu;
 using GpsGlobalOrigin = Telemetry::GpsGlobalOrigin;
 
-Telemetry::Telemetry(System& system) : PluginBase(), _impl{new TelemetryImpl(system)} {}
+Telemetry::Telemetry(System& system) : PluginBase(), _impl{std::make_unique<TelemetryImpl>(system)}
+{}
 
 Telemetry::Telemetry(std::shared_ptr<System> system) :
     PluginBase(),
-    _impl{new TelemetryImpl(system)}
+    _impl{std::make_unique<TelemetryImpl>(system)}
 {}
 
 Telemetry::~Telemetry() {}
@@ -1230,6 +1231,8 @@ std::ostream& operator<<(std::ostream& str, Telemetry::Result const& result)
             return str << "Command Denied";
         case Telemetry::Result::Timeout:
             return str << "Timeout";
+        case Telemetry::Result::Unsupported:
+            return str << "Unsupported";
         default:
             return str << "Unknown";
     }

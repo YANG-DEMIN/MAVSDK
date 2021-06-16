@@ -104,6 +104,9 @@ private:
 
     void send_heartbeat();
 
+    static uint8_t get_target_system_id(const mavlink_message_t& message);
+    static uint8_t get_target_component_id(const mavlink_message_t& message);
+
     std::mutex _connections_mutex{};
     std::vector<std::shared_ptr<Connection>> _connections{};
 
@@ -141,6 +144,8 @@ private:
     std::thread* _work_thread{nullptr};
     std::thread* _process_user_callbacks_thread{nullptr};
     SafeQueue<UserCallback> _user_callback_queue{};
+
+    bool _message_logging_on{false};
     bool _callback_debugging{false};
 
     std::atomic<double> _timeout_s{Mavsdk::DEFAULT_TIMEOUT_S};
