@@ -27,6 +27,13 @@ MavsdkImpl::MavsdkImpl() : timeout_handler(_time), call_every_handler(_time)
         }
     }
 
+    if (const char* env_p = std::getenv("MAVSDK_MESSAGE_DEBUGGING")) {
+        if (env_p && std::string("1").compare(env_p) == 0) {
+            LogDebug() << "Message debugging is on.";
+            _message_logging_on = true;
+        }
+    }
+
     _work_thread = new std::thread(&MavsdkImpl::work_thread, this);
 
     _process_user_callbacks_thread =
@@ -112,30 +119,12 @@ std::vector<std::shared_ptr<System>> MavsdkImpl::systems() const
 
 void MavsdkImpl::forward_message(mavlink_message_t& message, Connection* connection)
 {
-    /**
-     * @brief forward_message Function implementing Mavlink routing rules.
-     * See https://mavlink.io/en/guide/routing.html
-     *
-     * This function was adapted from PX4 Firmware v1.11.3
-     * https://github.com/PX4/PX4-Autopilot/blob/v1.11.3/src/modules/mavlink/mavlink_main.cpp#L460
-     */
-    const mavlink_msg_entry_t* meta = mavlink_get_msg_entry(message.msgid);
+    // Forward_message Function implementing Mavlink routing rules.
+    // See https://mavlink.io/en/guide/routing.html
 
     bool forward_heartbeats_enabled = true;
-    int target_system_id = 0;
-    int target_component_id = 0;
-
-    // might be nullptr if message is unknown
-    if (meta) {
-        // Extract target system and target component if set
-        if (meta->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_SYSTEM) {
-            target_system_id = (_MAV_PAYLOAD(&message))[meta->target_system_ofs];
-        }
-
-        if (meta->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_COMPONENT) {
-            target_component_id = (_MAV_PAYLOAD(&message))[meta->target_component_ofs];
-        }
-    }
+    const uint8_t target_system_id = get_target_system_id(message);
+    const uint8_t target_component_id = get_target_component_id(message);
 
     // If it's a message only for us, we keep it, otherwise, we forward it.
     const bool targeted_only_at_us =
@@ -167,6 +156,11 @@ void MavsdkImpl::forward_message(mavlink_message_t& message, Connection* connect
 
 void MavsdkImpl::receive_message(mavlink_message_t& message, Connection* connection)
 {
+    if (_message_logging_on) {
+        LogDebug() << "Processing message " << message.msgid << " from "
+                   << static_cast<int>(message.sysid) << "/" << static_cast<int>(message.compid);
+    }
+
     /** @note: Forward message if option is enabled and multiple interfaces are connected.
      *  Performs message forwarding checks for every messages if message forwarding
      *  is enabled on at least one connection, and in case of a single forwarding connection,
@@ -180,11 +174,19 @@ void MavsdkImpl::receive_message(mavlink_message_t& message, Connection* connect
     if (_connections.size() > 1 && connection->forwarding_connections_count() > 0 &&
         (connection->forwarding_connections_count() > 1 ||
          !connection->should_forward_messages())) {
+        if (_message_logging_on) {
+            LogDebug() << "Forwarding message " << message.msgid << " from "
+                       << static_cast<int>(message.sysid) << "/"
+                       << static_cast<int>(message.compid);
+        }
         forward_message(message, connection);
     }
 
     // Don't ever create a system with sysid 0.
     if (message.sysid == 0) {
+        if (_message_logging_on) {
+            LogDebug() << "Ignoring message with sysid == 0";
+        }
         return;
     }
 
@@ -198,6 +200,9 @@ void MavsdkImpl::receive_message(mavlink_message_t& message, Connection* connect
     // instead of PX4 because the check `has_autopilot()` is not used.
     if (_configuration.get_usage_type() == Mavsdk::Configuration::UsageType::GroundStation &&
         message.sysid == 255 && message.compid == MAV_COMP_ID_MISSIONPLANNER) {
+        if (_message_logging_on) {
+            LogDebug() << "Ignoring messages from QGC as we are also a ground station";
+        }
         return;
     }
 
@@ -237,19 +242,19 @@ void MavsdkImpl::receive_message(mavlink_message_t& message, Connection* connect
 
 bool MavsdkImpl::send_message(mavlink_message_t& message)
 {
+    if (_message_logging_on) {
+        LogDebug() << "Sending message " << message.msgid << " from "
+                   << static_cast<int>(message.sysid) << "/" << static_cast<int>(message.compid);
+    }
+
     std::lock_guard<std::mutex> lock(_connections_mutex);
 
     uint8_t successful_emissions = 0;
     for (auto it = _connections.begin(); it != _connections.end(); ++it) {
-        // Checks whether connection knows target system ID by extracting target system if set.
-        // https://github.com/PX4/PX4-Autopilot/blob/v1.11.3/src/modules/mavlink/mavlink_main.cpp#L472
-        const mavlink_msg_entry_t* meta = mavlink_get_msg_entry(message.msgid);
+        const uint8_t target_system_id = get_target_system_id(message);
 
-        if (meta && meta->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_SYSTEM) {
-            int target_system_id = (_MAV_PAYLOAD(&message))[meta->target_system_ofs];
-            if (!(**it).has_system_id(target_system_id)) {
-                continue;
-            }
+        if (target_system_id != 0 && !(**it).has_system_id(target_system_id)) {
+            continue;
         }
 
         if ((**it).send_message(message)) {
@@ -710,6 +715,42 @@ void MavsdkImpl::send_heartbeat()
         0,
         0);
     send_message(message);
+}
+
+uint8_t MavsdkImpl::get_target_system_id(const mavlink_message_t& message)
+{
+    // Checks whether connection knows target system ID by extracting target system if set.
+    const mavlink_msg_entry_t* meta = mavlink_get_msg_entry(message.msgid);
+
+    if (meta == nullptr || !(meta->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_SYSTEM)) {
+        return 0;
+    }
+
+    // Don't look at the target system offset if it is outside of the payload length.
+    // This can happen if the fields are trimmed.
+    if (meta->target_system_ofs >= message.len) {
+        return 0;
+    }
+
+    return (_MAV_PAYLOAD(&message))[meta->target_system_ofs];
+}
+
+uint8_t MavsdkImpl::get_target_component_id(const mavlink_message_t& message)
+{
+    // Checks whether connection knows target system ID by extracting target system if set.
+    const mavlink_msg_entry_t* meta = mavlink_get_msg_entry(message.msgid);
+
+    if (meta == nullptr || !(meta->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_COMPONENT)) {
+        return 0;
+    }
+
+    // Don't look at the target component offset if it is outside of the payload length.
+    // This can happen if the fields are trimmed.
+    if (meta->target_component_ofs >= message.len) {
+        return 0;
+    }
+
+    return (_MAV_PAYLOAD(&message))[meta->target_system_ofs];
 }
 
 } // namespace mavsdk
